@@ -1,4 +1,4 @@
--- AutoHeroicQueue
+-- AutoHeroicQueue (Ascension edition)
 -- При входе в игру автоматически выставляет в дропдауне "Тип" сохранённый выбор.
 -- /ahq - открыть окно выбора нужного варианта из списка (сохраняется навсегда).
 
@@ -14,6 +14,12 @@ local function Debug(msg)
         print("|cff33ff99[AutoHeroicQueue]|r " .. msg)
     end
 end
+
+-- Имена фреймов на Ascension (уточнены по /fstack, см. скриншоты).
+-- Если после патча имена сменятся - поменяй тут.
+local ROOT_FRAME_NAME   = "AscensionLFGFrame"
+local LFD_FRAME_NAME    = "AscensionPVEFrameLFDFrame"
+local TYPE_DROPDOWN_NAME = "AscensionPVEFrameLFDFrameTypeDropDown"
 
 -- Собирает список всех вариантов, которые показываются в дропдауне "Тип"
 -- (те же условия, что использует сама Blizzard в LFDQueueFrameTypeDropDown_Initialize)
@@ -35,20 +41,70 @@ local function GetAllTypeOptions()
     return options
 end
 
+-- Эмулирует выбор пункта в стандартном UIDropDownMenu, к которому привязан
+-- дропдаун "Тип" на Ascension. Мы не знаем их внутреннюю set-функцию,
+-- но нам это и не нужно: открываем меню (Ascension сам заполнит
+-- DropDownList1 актуальными пунктами через свой Initialize) и жмём
+-- нужную кнопку по тексту - это триггернёт их родной OnClick/func так,
+-- будто кликнул сам игрок.
+local function ClickDropdownOptionByName(dropDown, optionName)
+    if not dropDown then
+        return false
+    end
+
+    ToggleDropDownMenu(1, nil, dropDown, "cursor", 0, 0)
+
+    local found = false
+    local maxButtons = UIDROPDOWNMENU_MAXBUTTONS or 32
+    for i = 1, maxButtons do
+        local btn = _G["DropDownList1Button" .. i]
+        if btn and btn:IsShown() then
+            local text = btn:GetText()
+            if text == optionName then
+                btn:Click()
+                found = true
+                break
+            end
+        end
+    end
+
+    if not found then
+        CloseDropDownMenus()
+    end
+
+    return found
+end
+
 local function ApplySavedType()
-    if not LFDQueueFrame then
+    local lfdFrame = _G[LFD_FRAME_NAME]
+    if not lfdFrame then
         return
     end
     if not AutoHeroicQueueDB.selectedDungeonID then
         Debug("Сохранённого выбора нет (похоже, SavedVariables не записались с прошлой сессии). Набери /ahq и выбери заново.")
         return
     end
-    if not IsLFGDungeonJoinable(AutoHeroicQueueDB.selectedDungeonID) then
+
+    -- IsLFGDungeonJoinable может отсутствовать/вести себя иначе на Ascension -
+    -- страхуемся pcall'ом, чтобы не сломать остальное, если функции нет.
+    local ok, joinable = pcall(IsLFGDungeonJoinable, AutoHeroicQueueDB.selectedDungeonID)
+    if ok and joinable == false then
         Debug("Сохранённый выбор ('" .. tostring(AutoHeroicQueueDB.selectedDungeonName) .. "') сейчас недоступен, пропуск.")
         return
     end
-    LFDQueueFrame_SetType(AutoHeroicQueueDB.selectedDungeonID)
-    Debug("Тип очереди выставлен: " .. tostring(AutoHeroicQueueDB.selectedDungeonName))
+
+    local dropDown = _G[TYPE_DROPDOWN_NAME]
+    if not dropDown then
+        Debug("Не найден дропдаун типа (" .. TYPE_DROPDOWN_NAME .. "). Возможно, имя фрейма изменилось - проверь через /fstack.")
+        return
+    end
+
+    local success = ClickDropdownOptionByName(dropDown, AutoHeroicQueueDB.selectedDungeonName)
+    if success then
+        Debug("Тип очереди выставлен: " .. tostring(AutoHeroicQueueDB.selectedDungeonName))
+    else
+        Debug("Не удалось найти пункт '" .. tostring(AutoHeroicQueueDB.selectedDungeonName) .. "' в дропдауне сейчас.")
+    end
 end
 
 AHQ:SetScript("OnEvent", function(self, event, ...)
@@ -63,10 +119,15 @@ AHQ:SetScript("OnEvent", function(self, event, ...)
     end)
 end)
 
-if LFDParentFrame then
-    LFDParentFrame:HookScript("OnShow", function()
-        ApplySavedType()
-    end)
+do
+    local rootFrame = _G[ROOT_FRAME_NAME]
+    if rootFrame then
+        rootFrame:HookScript("OnShow", function()
+            ApplySavedType()
+        end)
+    else
+        Debug("Не найден корневой фрейм (" .. ROOT_FRAME_NAME .. ") для автопривязки к OnShow - автовыбор при открытии окна вручную работать не будет, только при входе в игру.")
+    end
 end
 
 ----------------------------------------------------------------
@@ -90,6 +151,22 @@ local function GetElvUI()
         return E
     end
     return nil
+end
+
+-- Безопасно дёргает метод модуля Skins: не падает, если модуля/метода
+-- нет или он ещё не готов (частая история на кастомных серверах,
+-- где версия/сборка ElvUI отличается от привычной).
+-- Возвращает true, если метод реально нашёлся и выполнился без ошибок.
+local function SafeSkin(S, methodName, ...)
+    if not S or type(S[methodName]) ~= "function" then
+        return false
+    end
+    local ok, err = pcall(S[methodName], S, ...)
+    if not ok then
+        Debug("ElvUI skin (" .. methodName .. ") не сработал: " .. tostring(err))
+        return false
+    end
+    return true
 end
 
 local function BuildConfigFrame()
@@ -120,10 +197,8 @@ local function BuildConfigFrame()
     local height = 78 + numOptions * (BUTTON_HEIGHT + BUTTON_GAP)
     frame:SetSize(FRAME_WIDTH, height)
 
-    if S then
-        -- Скиним основной фрейм под ElvUI (второй аргумент true = стандартная тёмная подложка)
-        S:HandleFrame(frame, true)
-    else
+    local skinned = S and SafeSkin(S, "HandleFrame", frame, true)
+    if not skinned then
         frame:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
             edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -139,7 +214,7 @@ local function BuildConfigFrame()
     local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", -2, -2)
     if S then
-        S:HandleCloseButton(closeButton)
+        SafeSkin(S, "HandleCloseButton", closeButton)
     end
 
     local current = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -166,10 +241,9 @@ local function BuildConfigFrame()
         end)
 
         if S then
-            S:HandleButton(btn)
+            SafeSkin(S, "HandleButton", btn)
         end
 
-        -- Подсвечиваем текущий выбранный вариант зелёным
         if AutoHeroicQueueDB.selectedDungeonID == option.id then
             local textObj = btn:GetFontString()
             if textObj then
@@ -180,7 +254,7 @@ local function BuildConfigFrame()
         lastButton = btn
     end
 
-    frame:Hide() -- фрейм по умолчанию создаётся видимым, прячем сразу после сборки
+    frame:Hide()
     return frame
 end
 
@@ -190,8 +264,6 @@ local function ToggleConfigFrame()
         return
     end
 
-    -- Пересобираем окно заново при каждом открытии, чтобы подсветка
-    -- текущего выбора всегда была актуальной.
     if AutoHeroicQueueConfigFrame then
         AutoHeroicQueueConfigFrame:Hide()
         AutoHeroicQueueConfigFrame:SetParent(nil)
@@ -207,4 +279,4 @@ SlashCmdList["AUTOHEROICQUEUE"] = function()
     ToggleConfigFrame()
 end
 
-Debug("Аддон загружен. /ahq - открыть меню выбора подземелья.")
+Debug("Аддон загружен (Ascension edition). /ahq - открыть меню выбора подземелья.")
