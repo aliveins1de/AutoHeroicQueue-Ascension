@@ -1,0 +1,18 @@
+# OS / редакторы
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Локальные SavedVariables (личные данные, не для репозитория)
+*.lua.bak
+SavedVariables/
+*_SavedVariables.lua
+
+# Архивы, которые иногда случайно кладут рядом при апдейте аддона
+*.zip
+*.rar
+*.7z
